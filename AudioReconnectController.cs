@@ -6,10 +6,12 @@ using System.Runtime.InteropServices;
 using HarmonyLib;
 using OpenTK.Audio.OpenAL;
 using Robust.Client.Audio;
+using Robust.Client.Audio.Midi;
 using Robust.Client.ResourceManagement;
 using Robust.Client.UserInterface;
 using Robust.Shared;
 using Robust.Shared.Asynchronous;
+using Robust.Shared.Audio;
 using Robust.Shared.Audio.Components;
 using Robust.Shared.Audio.Effects;
 using Robust.Shared.Audio.Sources;
@@ -27,6 +29,8 @@ public static class AudioReconnectController
     private const float PlaybackEndSafetySeconds = 0.01f;
     private const float UiClickGain = 0.25f;
     private const float UiHoverGain = 0.05f;
+    private const int MidiSampleRate = 44100;
+    private const int MidiBufferCount = MidiSampleRate / 2205;
     private const int ConsecutiveProbeErrorsBeforeReconnect = 1;
 
     // ALC_EXT_disconnect: ALC_CONNECTED.
@@ -44,6 +48,7 @@ public static class AudioReconnectController
     private static IGameTiming? _timing;
     private static IConfigurationManager? _configManager;
     private static IUserInterfaceManager? _uiManager;
+    private static IMidiManager? _midiManager;
     private static ThreadingTimer? _watchdog;
 
     private static bool _watchdogEnabled = true;
@@ -198,6 +203,19 @@ public static class AudioReconnectController
         catch
         {
             // UI sound restoration is best-effort.
+        }
+
+        try
+        {
+            if (_midiManager == null && IoCManager.Resolve<IMidiManager>() is { } midiManager)
+            {
+                _midiManager = midiManager;
+                MarseyLogger.Debug("Resolved IMidiManager.");
+            }
+        }
+        catch
+        {
+            // MIDI is optional and may not be initialized.
         }
     }
 
@@ -390,7 +408,6 @@ public static class AudioReconnectController
             if (!string.Equals(_lastWindowsDefaultRenderEndpointId, windowsDefault, StringComparison.Ordinal))
             {
                 details = "Windows default render endpoint changed.";
-                _lastWindowsDefaultRenderEndpointId = windowsDefault;
                 return true;
             }
         }
@@ -409,7 +426,6 @@ public static class AudioReconnectController
             return false;
 
         details = $"OpenAL default device changed: '{_lastDefaultDeviceSpecifier}' -> '{currentDefault}'";
-        _lastDefaultDeviceSpecifier = currentDefault;
         return true;
     }
 
@@ -562,6 +578,7 @@ public static class AudioReconnectController
 
             MarseyLogger.Warn($"Audio reconnect started: {reason}");
 
+            var suspendedMidiRenderers = SuspendMidiRenderers();
             ClearUiSoundReferences();
             TryInvokeNoArgs(_audioManager, "Shutdown");
             ClearAudioManagerRuntimeCollections(_audioManager);
@@ -569,13 +586,15 @@ public static class AudioReconnectController
             ResetOpenAlFields(_audioManager);
             InvokeNoArgs(_audioManager, "InitializePostWindowing");
             CaptureDefaultDeviceSpecifier();
+            var restoredMidiRenderers = RestoreMidiRenderers(suspendedMidiRenderers);
+            RefreshMidiManagerAfterRestore(restoredMidiRenderers > 0);
             var sanitized = SanitizeAudioComponents();
             RestoreUiSounds();
             DrainOpenAlErrors();
 
             _consecutiveProbeErrors = 0;
             _lastReconnectUtc = DateTime.UtcNow;
-            MarseyLogger.Info($"Audio reconnect finished. Cleared cached audio resources: {clearedResources}. Sanitized components: {sanitized}.");
+            MarseyLogger.Info($"Audio reconnect finished. Cleared cached audio resources: {clearedResources}. Sanitized components: {sanitized}. Restored MIDI renderers: {restoredMidiRenderers}/{suspendedMidiRenderers.Count}.");
         }
         catch (Exception e)
         {
@@ -655,6 +674,160 @@ public static class AudioReconnectController
         }
 
         return sanitized;
+    }
+
+    private static List<MidiRendererRecovery> SuspendMidiRenderers()
+    {
+        ResolveServices();
+
+        if (_midiManager == null)
+            return [];
+
+        try
+        {
+            var renderers = new List<MidiRendererRecovery>();
+            var dummySource = GetDummyBufferedAudioSource();
+            if (dummySource == null)
+                return renderers;
+
+            foreach (var renderer in _midiManager.Renderers)
+            {
+                if (renderer.Disposed)
+                    continue;
+
+                try
+                {
+                    lock (renderer)
+                    {
+                        if (renderer.Disposed)
+                            continue;
+
+                        var sourceState = MidiSourceState.Capture(GetRendererSource(renderer) as IAudioSource);
+
+                        if (SetRendererSource(renderer, dummySource))
+                            renderers.Add(new MidiRendererRecovery(renderer, sourceState));
+                    }
+                }
+                catch
+                {
+                    // A racing MIDI thread may already be cleaning this renderer.
+                }
+            }
+
+            return renderers;
+        }
+        catch (Exception e)
+        {
+            MarseyLogger.Warn($"MIDI renderer suspend failed: {e.Message}");
+            return [];
+        }
+    }
+
+    private static int RestoreMidiRenderers(IReadOnlyList<MidiRendererRecovery> renderers)
+    {
+        if (_audioManager == null || renderers.Count == 0)
+            return 0;
+
+        var restored = 0;
+
+        foreach (var recovery in renderers)
+        {
+            var renderer = recovery.Renderer;
+            if (renderer.Disposed)
+                continue;
+
+            try
+            {
+                var source = CreateMidiBufferedSource(_audioManager);
+                if (source == null)
+                    continue;
+
+                SetProperty(source, "SampleRate", MidiSampleRate);
+                InvokeNoArgs(source, "EmptyBuffers");
+                recovery.SourceState.Apply(source as IAudioSource);
+                InvokeNoArgs(source, "StartPlaying");
+
+                lock (renderer)
+                {
+                    if (renderer.Disposed)
+                        continue;
+
+                    if (SetRendererSource(renderer, source))
+                        restored++;
+                }
+            }
+            catch (Exception e)
+            {
+                MarseyLogger.Warn($"MIDI renderer restore failed: {e.Message}");
+            }
+        }
+
+        return restored;
+    }
+
+    private static void RefreshMidiManagerAfterRestore(bool restoredAny)
+    {
+        if (!restoredAny || _midiManager == null)
+            return;
+
+        try
+        {
+            var type = _midiManager.GetType();
+            SetFieldValue(type, _midiManager, "_gainDirty", true);
+            SetFieldValue(type, _midiManager, "_nextUpdate", TimeSpan.Zero);
+            _midiManager.FrameUpdate(0f);
+        }
+        catch (Exception e)
+        {
+            MarseyLogger.Warn($"MIDI manager refresh failed: {e.Message}");
+        }
+    }
+
+    private static object? CreateMidiBufferedSource(object audioManager)
+    {
+        var method = audioManager.GetType()
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(method =>
+            {
+                if (!method.Name.EndsWith("CreateBufferedAudioSource", StringComparison.Ordinal))
+                    return false;
+
+                var parameters = method.GetParameters();
+                return parameters.Length == 2 &&
+                       parameters[0].ParameterType == typeof(int) &&
+                       parameters[1].ParameterType == typeof(bool);
+            });
+
+        return method?.Invoke(audioManager, [MidiBufferCount, true]);
+    }
+
+    private static object? GetDummyBufferedAudioSource()
+    {
+        var type = AccessTools.TypeByName("Robust.Shared.Audio.Sources.DummyBufferedAudioSource");
+        return type
+            ?.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+            ?.GetValue(null);
+    }
+
+    private static object? GetRendererSource(IMidiRenderer renderer)
+    {
+        return renderer
+            .GetType()
+            .GetProperty("Source", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?.GetValue(renderer);
+    }
+
+    private static bool SetRendererSource(IMidiRenderer renderer, object source)
+    {
+        var property = renderer.GetType().GetProperty(
+            "Source",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (property == null || !property.CanWrite)
+            return false;
+
+        property.SetValue(renderer, source);
+        return true;
     }
 
     private static void RestoreUiSounds()
@@ -930,6 +1103,15 @@ public static class AudioReconnectController
         field?.SetValue(instance, value);
     }
 
+    private static void SetProperty(object instance, string name, object? value)
+    {
+        var property = instance
+            .GetType()
+            .GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        property?.SetValue(instance, value);
+    }
+
     private static void ClearCollectionField(Type type, object instance, string name)
     {
         var field = type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
@@ -1092,5 +1274,111 @@ public static class AudioReconnectController
         public void SetAuxiliary(IAuxiliaryAudio? audio)
         {
         }
+    }
+
+    private sealed record MidiRendererRecovery(IMidiRenderer Renderer, MidiSourceState SourceState);
+
+    private sealed class MidiSourceState
+    {
+        private readonly bool _hasSource;
+        private readonly bool _looping;
+        private readonly bool _global;
+        private readonly Vector2 _position;
+        private readonly Vector2 _velocity;
+        private readonly float _pitch;
+        private readonly float _gain;
+        private readonly float _maxDistance;
+        private readonly float _rolloffFactor;
+        private readonly float _referenceDistance;
+        private readonly float _occlusion;
+
+        private MidiSourceState(
+            bool hasSource,
+            bool looping,
+            bool global,
+            Vector2 position,
+            Vector2 velocity,
+            float pitch,
+            float gain,
+            float maxDistance,
+            float rolloffFactor,
+            float referenceDistance,
+            float occlusion)
+        {
+            _hasSource = hasSource;
+            _looping = looping;
+            _global = global;
+            _position = position;
+            _velocity = velocity;
+            _pitch = pitch;
+            _gain = gain;
+            _maxDistance = maxDistance;
+            _rolloffFactor = rolloffFactor;
+            _referenceDistance = referenceDistance;
+            _occlusion = occlusion;
+        }
+
+        public static MidiSourceState Capture(IAudioSource? source)
+        {
+            if (source == null)
+                return Empty;
+
+            try
+            {
+                return new MidiSourceState(
+                    true,
+                    source.Looping,
+                    source.Global,
+                    source.Position,
+                    source.Velocity,
+                    source.Pitch,
+                    source.Gain,
+                    source.MaxDistance,
+                    source.RolloffFactor,
+                    source.ReferenceDistance,
+                    source.Occlusion);
+            }
+            catch
+            {
+                return Empty;
+            }
+        }
+
+        public void Apply(IAudioSource? source)
+        {
+            if (!_hasSource || source == null)
+                return;
+
+            try
+            {
+                source.Looping = _looping;
+                source.Global = _global;
+                source.Position = _position;
+                source.Velocity = _velocity;
+                source.Pitch = _pitch;
+                source.MaxDistance = _maxDistance;
+                source.RolloffFactor = _rolloffFactor;
+                source.ReferenceDistance = _referenceDistance;
+                source.Occlusion = _occlusion;
+                source.Gain = _gain;
+            }
+            catch
+            {
+                // Source state restore is best-effort. The MIDI manager frame update will reapply live parameters.
+            }
+        }
+
+        private static MidiSourceState Empty { get; } = new(
+            false,
+            false,
+            false,
+            Vector2.Zero,
+            Vector2.Zero,
+            1f,
+            1f,
+            AudioParams.Default.MaxDistance,
+            AudioParams.Default.RolloffFactor,
+            AudioParams.Default.ReferenceDistance,
+            0f);
     }
 }

@@ -2,7 +2,7 @@
 
 RobustToolbox audio reconnect
 
-Current stable version: `1.0.16`
+Current stable version: `1.0.20`
 
 ## Build
 
@@ -43,7 +43,11 @@ Copy-Item .\bin\Release\net10.0\FurryAudioReconnect.dll $modPath -Force
 - Version `1.0.14` ignores stale queued OpenAL errors during health checks to avoid false reconnect loops.
 - Version `1.0.15` reconnects when the system default audio output changes while the previous output is still connected.
 - Version `1.0.16` also tracks the Windows CoreAudio default render endpoint so returned default devices are detected.
-- Version `1.0.16` is the stable release. Patch diagnostics are silent during normal operation and only fatal patch errors are written to file.
+- Version `1.0.16` is the previous stable release. Patch diagnostics are silent during normal operation and only fatal patch errors are written to file.
+- Version `1.0.17` disposes active MIDI renderers before reconnect and guards the MIDI render thread against stale buffered audio sources.
+- Version `1.0.18` keeps active MIDI renderers alive by swapping them to a dummy source during reconnect and assigning a fresh buffered source afterwards.
+- Version `1.0.19` preserves MIDI source state across reconnect and forces `MidiManager` to refresh restored renderers immediately.
+- Version `1.0.20` avoids accepting a changed default device as current until reconnect actually finishes, preventing rapid switch/cooldown races.
 
 ## How it works
 
@@ -89,9 +93,10 @@ thread. The reconnect sequence is:
 5. Reset private AudioManager OpenAL fields and extension caches.
 6. Call `AudioManager.InitializePostWindowing()` to create a fresh OpenAL device and context.
 7. Capture the new default device identifiers.
-8. Replace existing entity `AudioComponent.Source` values with a no-op `NullAudioSource`.
-9. Recreate UI click/hover sounds from the new OpenAL context.
-10. Drain stale OpenAL errors left from the old context.
+8. Restore active MIDI renderers with fresh buffered audio sources and reapply their source state.
+9. Replace existing entity `AudioComponent.Source` values with a no-op `NullAudioSource`.
+10. Recreate UI click/hover sounds from the new OpenAL context.
+11. Drain stale OpenAL errors left from the old context.
 
 The patch intentionally clears cached audio resources instead of eagerly reloading every sound.
 New sounds are loaded naturally by Robust when they are needed. This avoids stale OpenAL buffer IDs,
@@ -102,6 +107,13 @@ Existing world audio components are sanitized with `NullAudioSource` instead of 
 Looping or currently active sounds are allowed to recover through normal Robust audio flow when the
 game asks for them again. This is less aggressive, but it avoids resurrecting stale hit, swing, step,
 ambient, or UI sounds after the OpenAL context has been rebuilt.
+
+MIDI renderers need separate handling because they own buffered audio sources and run through the
+MIDI manager's render/update path. Before reconnect, active renderers are temporarily moved to a
+dummy buffered source so the MIDI thread cannot touch a disposed OpenAL source while the device is
+being rebuilt. After reconnect, each renderer gets a fresh buffered source with the original source
+state reapplied. The patch then marks the MIDI manager's gain/update state dirty and runs one frame
+update so restored MIDI audio can resume without waiting for the normal update interval.
 
 ## Logging
 
