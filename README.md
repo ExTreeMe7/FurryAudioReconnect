@@ -48,6 +48,7 @@ Copy-Item .\bin\Release\net10.0\FurryAudioReconnect.dll $modPath -Force
 - Version `1.0.18` keeps active MIDI renderers alive by swapping them to a dummy source during reconnect and assigning a fresh buffered source afterwards.
 - Version `1.0.19` preserves MIDI source state across reconnect and forces `MidiManager` to refresh restored renderers immediately.
 - Version `1.0.20` avoids accepting a changed default device as current until reconnect actually finishes, preventing rapid switch/cooldown races.
+- Version `1.0.21` resolves OpenAL calls through a runtime compatibility adapter instead of directly referencing `OpenTK.Audio.OpenAL`, avoiding startup crashes on engines with different OpenTK layouts.
 
 ## How it works
 

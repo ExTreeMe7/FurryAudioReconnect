@@ -6,21 +6,22 @@
     <LangVersion>latest</LangVersion>
     <RootNamespace>FurryAudioReconnect</RootNamespace>
     <AssemblyName>FurryAudioReconnect</AssemblyName>
-    <Version>1.0.20</Version>
-    <AssemblyVersion>1.0.20.0</AssemblyVersion>
-    <FileVersion>1.0.20.0</FileVersion>
+    <Version>1.0.21</Version>
+    <AssemblyVersion>1.0.21.0</AssemblyVersion>
+    <FileVersion>1.0.21.0</FileVersion>
     <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <WizdenRoot Condition="'$(WizdenRoot)' == '' and Exists('..\..\..\Wizden\wizard-space-station-14\RobustToolbox')">..\..\..\Wizden\wizard-space-station-14</WizdenRoot>
+    <WizdenRoot Condition="'$(WizdenRoot)' == ''">C:\Users\extreeme\Desktop\IDE\wizard-space-station-14</WizdenRoot>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Lib.Harmony" Version="2.3.6" />
-    <PackageReference Include="OpenTK.Audio.OpenAL" Version="4.9.4" />
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\..\Wizden\wizard-space-station-14\RobustToolbox\Robust.Shared\Robust.Shared.csproj" Private="false" />
-    <ProjectReference Include="..\..\..\Wizden\wizard-space-station-14\RobustToolbox\Robust.Client\Robust.Client.csproj" Private="false" />
-    <ProjectReference Include="..\..\..\Wizden\wizard-space-station-14\Content.Shared\Content.Shared.csproj" Private="false" />
+    <ProjectReference Include="$(WizdenRoot)\RobustToolbox\Robust.Shared\Robust.Shared.csproj" Private="false" />
+    <ProjectReference Include="$(WizdenRoot)\RobustToolbox\Robust.Client\Robust.Client.csproj" Private="false" />
+    <ProjectReference Include="$(WizdenRoot)\Content.Shared\Content.Shared.csproj" Private="false" />
   </ItemGroup>
 </Project>

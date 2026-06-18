@@ -4,7 +4,6 @@ using System.Numerics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using HarmonyLib;
-using OpenTK.Audio.OpenAL;
 using Robust.Client.Audio;
 using Robust.Client.Audio.Midi;
 using Robust.Client.ResourceManagement;
@@ -54,6 +53,7 @@ public static class AudioReconnectController
     private static bool _watchdogEnabled = true;
     private static bool _reconnectQueued;
     private static bool _reconnectRunning;
+    private static bool _openAlUnavailableLogged;
     private static int _consecutiveProbeErrors;
     private static DateTime _lastTickUtc = DateTime.MinValue;
     private static DateTime _lastReconnectUtc = DateTime.MinValue;
@@ -262,17 +262,29 @@ public static class AudioReconnectController
 
     private static bool IsOpenAlHealthy(out string details)
     {
+        if (!OpenAlCompat.IsAvailable)
+        {
+            details = OpenAlCompat.UnavailableReason;
+            if (!_openAlUnavailableLogged)
+            {
+                _openAlUnavailableLogged = true;
+                MarseyLogger.Warn($"OpenAL compatibility adapter unavailable; watchdog probe disabled. {details}");
+            }
+
+            return true;
+        }
+
         DrainOpenAlErrors();
 
-        var context = ALC.GetCurrentContext();
-        if (context == ALContext.Null)
+        var context = OpenAlCompat.GetCurrentContext();
+        if (OpenAlCompat.IsNullContext(context))
         {
             details = "OpenAL current context is null";
             return false;
         }
 
-        var device = ALC.GetContextsDevice(context);
-        if (device == ALDevice.Null)
+        var device = OpenAlCompat.GetContextsDevice(context);
+        if (OpenAlCompat.IsNullDevice(device))
         {
             details = "OpenAL current device is null";
             return false;
@@ -293,7 +305,7 @@ public static class AudioReconnectController
 
         try
         {
-            AL.Listener(ALListenerf.Gain, GetCurrentMasterGain());
+            OpenAlCompat.ListenerGain(GetCurrentMasterGain());
         }
         catch (Exception e)
         {
@@ -301,10 +313,10 @@ public static class AudioReconnectController
             return false;
         }
 
-        var listenerError = AL.GetError();
-        if (listenerError != ALError.NoError)
+        var listenerError = OpenAlCompat.GetError();
+        if (!OpenAlCompat.IsNoError(listenerError))
         {
-            details = $"OpenAL listener probe error={listenerError}";
+            details = $"OpenAL listener probe error={OpenAlCompat.FormatError(listenerError)}";
             DrainOpenAlErrors();
             return false;
         }
@@ -326,11 +338,11 @@ public static class AudioReconnectController
         try
         {
             DrainOpenAlErrors();
-            source = AL.GenSource();
-            var error = AL.GetError();
-            var isSource = source != 0 && AL.IsSource(source);
-            details = $"source={source}, isSource={isSource}, error={error}";
-            return isSource && error == ALError.NoError;
+            source = OpenAlCompat.GenSource();
+            var error = OpenAlCompat.GetError();
+            var isSource = source != 0 && OpenAlCompat.IsSource(source);
+            details = $"source={source}, isSource={isSource}, error={OpenAlCompat.FormatError(error)}";
+            return isSource && OpenAlCompat.IsNoError(error);
         }
         catch (Exception e)
         {
@@ -343,7 +355,7 @@ public static class AudioReconnectController
             {
                 try
                 {
-                    AL.DeleteSource(source);
+                    OpenAlCompat.DeleteSource(source);
                 }
                 catch
                 {
@@ -359,7 +371,7 @@ public static class AudioReconnectController
     {
         try
         {
-            AL.GetListener(ALListenerf.Gain, out var gain);
+            var gain = OpenAlCompat.GetListenerGain();
             if (gain >= 0f && !float.IsNaN(gain))
                 return gain;
         }
@@ -371,14 +383,14 @@ public static class AudioReconnectController
         return 1f;
     }
 
-    private static int TryGetAlcConnected(ALDevice device)
+    private static int TryGetAlcConnected(object? device)
     {
-        if (device == ALDevice.Null)
+        if (OpenAlCompat.IsNullDevice(device))
             return -1;
 
         try
         {
-            return ALC.GetInteger(device, (AlcGetInteger)AlcConnected);
+            return OpenAlCompat.GetInteger(device, AlcConnected);
         }
         catch
         {
@@ -454,21 +466,8 @@ public static class AudioReconnectController
 
     private static string? GetDefaultDeviceSpecifier()
     {
-        return TryGetAlcString(ALDevice.Null, AlcGetString.DefaultAllDevicesSpecifier)
-               ?? TryGetAlcString(ALDevice.Null, AlcGetString.DefaultDeviceSpecifier);
-    }
-
-    private static string? TryGetAlcString(ALDevice device, AlcGetString parameter)
-    {
-        try
-        {
-            var value = ALC.GetString(device, parameter);
-            return string.IsNullOrWhiteSpace(value) ? null : value;
-        }
-        catch
-        {
-            return null;
-        }
+        return OpenAlCompat.GetDefaultAllDevicesSpecifier()
+               ?? OpenAlCompat.GetDefaultDeviceSpecifier();
     }
 
     private static string? GetWindowsDefaultRenderEndpointKey()
@@ -912,7 +911,7 @@ public static class AudioReconnectController
         {
             for (var i = 0; i < 32; i++)
             {
-                if (AL.GetError() == ALError.NoError)
+                if (OpenAlCompat.IsNoError(OpenAlCompat.GetError()))
                     break;
             }
         }
@@ -1148,16 +1147,6 @@ public static class AudioReconnectController
             throw new MissingMethodException(instance.GetType().FullName, methodName);
 
         method.Invoke(instance, null);
-    }
-
-    private static string FormatHandle(ALContext context)
-    {
-        return context == ALContext.Null ? "null" : context.ToString() ?? "<unknown>";
-    }
-
-    private static string FormatHandle(ALDevice device)
-    {
-        return device == ALDevice.Null ? "null" : device.ToString() ?? "<unknown>";
     }
 
     private enum EDataFlow
