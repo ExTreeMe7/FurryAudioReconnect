@@ -262,9 +262,21 @@ public static class AudioReconnectController
 
     private static bool IsOpenAlHealthy(out string details)
     {
-        if (!OpenAlCompat.IsAvailable)
+        if (!IsOpenAlBridgeReady())
         {
-            details = OpenAlCompat.UnavailableReason;
+            details = "OpenAL compatibility bridge is not injected or incomplete";
+            if (!_openAlUnavailableLogged)
+            {
+                _openAlUnavailableLogged = true;
+                MarseyLogger.Warn($"OpenAL compatibility bridge unavailable; watchdog probe disabled. {details}");
+            }
+
+            return true;
+        }
+
+        if (CompatBridge.OpenAlIsAvailable != null && !CompatBridge.OpenAlIsAvailable())
+        {
+            details = CompatBridge.OpenAlUnavailableReason?.Invoke() ?? "OpenAL unavailable";
             if (!_openAlUnavailableLogged)
             {
                 _openAlUnavailableLogged = true;
@@ -276,15 +288,15 @@ public static class AudioReconnectController
 
         DrainOpenAlErrors();
 
-        var context = OpenAlCompat.GetCurrentContext();
-        if (OpenAlCompat.IsNullContext(context))
+        var context = CompatBridge.OpenAlGetCurrentContext?.Invoke();
+        if (CompatBridge.OpenAlIsNullContext != null && CompatBridge.OpenAlIsNullContext(context))
         {
             details = "OpenAL current context is null";
             return false;
         }
 
-        var device = OpenAlCompat.GetContextsDevice(context);
-        if (OpenAlCompat.IsNullDevice(device))
+        var device = CompatBridge.OpenAlGetContextsDevice?.Invoke(context);
+        if (CompatBridge.OpenAlIsNullDevice != null && CompatBridge.OpenAlIsNullDevice(device))
         {
             details = "OpenAL current device is null";
             return false;
@@ -305,7 +317,7 @@ public static class AudioReconnectController
 
         try
         {
-            OpenAlCompat.ListenerGain(GetCurrentMasterGain());
+            CompatBridge.OpenAlListenerGain?.Invoke(GetCurrentMasterGain());
         }
         catch (Exception e)
         {
@@ -313,10 +325,10 @@ public static class AudioReconnectController
             return false;
         }
 
-        var listenerError = OpenAlCompat.GetError();
-        if (!OpenAlCompat.IsNoError(listenerError))
+        var listenerError = CompatBridge.OpenAlGetError?.Invoke();
+        if (CompatBridge.OpenAlIsNoError != null && !CompatBridge.OpenAlIsNoError(listenerError))
         {
-            details = $"OpenAL listener probe error={OpenAlCompat.FormatError(listenerError)}";
+            details = $"OpenAL listener probe error={CompatBridge.OpenAlFormatError?.Invoke(listenerError)}";
             DrainOpenAlErrors();
             return false;
         }
@@ -331,6 +343,27 @@ public static class AudioReconnectController
         return true;
     }
 
+    private static bool IsOpenAlBridgeReady()
+    {
+        return CompatBridge.OpenAlIsAvailable != null
+               && CompatBridge.OpenAlUnavailableReason != null
+               && CompatBridge.OpenAlGetCurrentContext != null
+               && CompatBridge.OpenAlIsNullContext != null
+               && CompatBridge.OpenAlGetContextsDevice != null
+               && CompatBridge.OpenAlIsNullDevice != null
+               && CompatBridge.OpenAlListenerGain != null
+               && CompatBridge.OpenAlGetListenerGain != null
+               && CompatBridge.OpenAlGetError != null
+               && CompatBridge.OpenAlIsNoError != null
+               && CompatBridge.OpenAlFormatError != null
+               && CompatBridge.OpenAlGenSource != null
+               && CompatBridge.OpenAlIsSource != null
+               && CompatBridge.OpenAlDeleteSource != null
+               && CompatBridge.OpenAlGetInteger != null
+               && CompatBridge.OpenAlGetDefaultAllDevicesSpecifier != null
+               && CompatBridge.OpenAlGetDefaultDeviceSpecifier != null;
+    }
+
     private static bool TryProbeSource(out string details)
     {
         var source = 0;
@@ -338,11 +371,11 @@ public static class AudioReconnectController
         try
         {
             DrainOpenAlErrors();
-            source = OpenAlCompat.GenSource();
-            var error = OpenAlCompat.GetError();
-            var isSource = source != 0 && OpenAlCompat.IsSource(source);
-            details = $"source={source}, isSource={isSource}, error={OpenAlCompat.FormatError(error)}";
-            return isSource && OpenAlCompat.IsNoError(error);
+            source = CompatBridge.OpenAlGenSource?.Invoke() ?? 0;
+            var error = CompatBridge.OpenAlGetError?.Invoke();
+            var isSource = source != 0 && (CompatBridge.OpenAlIsSource?.Invoke(source) ?? false);
+            details = $"source={source}, isSource={isSource}, error={CompatBridge.OpenAlFormatError?.Invoke(error)}";
+            return isSource && (CompatBridge.OpenAlIsNoError?.Invoke(error) ?? false);
         }
         catch (Exception e)
         {
@@ -353,10 +386,10 @@ public static class AudioReconnectController
         {
             if (source != 0)
             {
-                try
-                {
-                    OpenAlCompat.DeleteSource(source);
-                }
+                    try
+                    {
+                        CompatBridge.OpenAlDeleteSource?.Invoke(source);
+                    }
                 catch
                 {
                     // Diagnostic probe only.
@@ -371,7 +404,7 @@ public static class AudioReconnectController
     {
         try
         {
-            var gain = OpenAlCompat.GetListenerGain();
+            var gain = CompatBridge.OpenAlGetListenerGain?.Invoke() ?? 1f;
             if (gain >= 0f && !float.IsNaN(gain))
                 return gain;
         }
@@ -385,12 +418,12 @@ public static class AudioReconnectController
 
     private static int TryGetAlcConnected(object? device)
     {
-        if (OpenAlCompat.IsNullDevice(device))
+        if (CompatBridge.OpenAlIsNullDevice != null && CompatBridge.OpenAlIsNullDevice(device))
             return -1;
 
         try
         {
-            return OpenAlCompat.GetInteger(device, AlcConnected);
+            return CompatBridge.OpenAlGetInteger?.Invoke(device, AlcConnected) ?? -1;
         }
         catch
         {
@@ -466,8 +499,8 @@ public static class AudioReconnectController
 
     private static string? GetDefaultDeviceSpecifier()
     {
-        return OpenAlCompat.GetDefaultAllDevicesSpecifier()
-               ?? OpenAlCompat.GetDefaultDeviceSpecifier();
+        return CompatBridge.OpenAlGetDefaultAllDevicesSpecifier?.Invoke()
+               ?? CompatBridge.OpenAlGetDefaultDeviceSpecifier?.Invoke();
     }
 
     private static string? GetWindowsDefaultRenderEndpointKey()
@@ -911,7 +944,7 @@ public static class AudioReconnectController
         {
             for (var i = 0; i < 32; i++)
             {
-                if (OpenAlCompat.IsNoError(OpenAlCompat.GetError()))
+                if (CompatBridge.OpenAlIsNoError != null && CompatBridge.OpenAlIsNoError(CompatBridge.OpenAlGetError?.Invoke()))
                     break;
             }
         }
